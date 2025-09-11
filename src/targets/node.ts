@@ -4,7 +4,7 @@ import express, { type Request, type Response, type RequestHandler } from "expre
 import cookieParser from "cookie-parser";
 import axios from "axios";
 import crypto from "crypto";
-import jwt from "jsonwebtoken"; // For Ghost Admin API auth
+import jwt from "jsonwebtoken"; // For Ghost Admin API and session cookies
 
 import { deferGetConfig } from "../services/config.js";
 import { useRequestLogging } from "../controllers/middleware.js";
@@ -51,19 +51,17 @@ function signHmac(payloadBase64: string): string {
   return crypto.createHmac("sha256", SSO_SECRET).update(payloadBase64).digest("hex");
 }
 
-function signCookie(payload: object, secret: string): string {
-  const body = Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
-  const sig = crypto.createHmac("sha256", secret).update(body).digest("base64url");
-  return `${body}.${sig}`;
+// --- JWT session helpers ---
+function signSessionJWT(payload: object, secret: string): string {
+  return jwt.sign(payload, secret, {
+    algorithm: "HS256",
+    expiresIn: SESSION_TTL_SECONDS,
+  });
 }
 
-function verifyCookie(token: string, secret: string): null | any {
-  const [body, sig] = token.split(".");
-  if (!body || !sig) return null;
-  const expected = crypto.createHmac("sha256", secret).update(body).digest("base64url");
-  if (expected !== sig) return null;
+function verifySessionJWT(token: string, secret: string): null | any {
   try {
-    return JSON.parse(Buffer.from(body, "base64url").toString("utf8"));
+    return jwt.verify(token, secret);
   } catch {
     return null;
   }
@@ -103,7 +101,7 @@ const loginFromGhost: RequestHandler = async (_req: Request, res: Response) => {
       exp: now + SESSION_TTL_SECONDS,
     };
 
-    const cookie = signCookie(payload, SESSION_SECRET);
+    const cookie = signSessionJWT(payload, SESSION_SECRET);
     res.cookie(SESSION_COOKIE, cookie, {
       httpOnly: true,
       secure: true,
@@ -152,8 +150,8 @@ const discourseSSOHandler: RequestHandler = async (req: Request, res: Response) 
     if (!nonce) return res.status(400).send("Missing nonce");
 
     const token = req.cookies?.[SESSION_COOKIE] as string | undefined;
-    const session = token ? verifyCookie(token, SESSION_SECRET) : null;
-    if (!session || session.exp <= Math.floor(Date.now() / 1000)) {
+    const session = token ? verifySessionJWT(token, SESSION_SECRET) : null;
+    if (!session || (typeof session === "object" && "exp" in session && (session.exp as number) <= Math.floor(Date.now() / 1000))) {
       return res.redirect(302, `${req.protocol}://${req.get("host")}/login-from-ghost`);
     }
 

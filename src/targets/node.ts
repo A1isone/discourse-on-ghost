@@ -54,7 +54,6 @@ function signHmac(payloadBase64: string): string {
 function signSessionJWT(payload: object, secret: string): string {
   return jwt.sign(payload, secret, {
     algorithm: "HS256",
-    expiresIn: SESSION_TTL_SECONDS,
   });
 }
 

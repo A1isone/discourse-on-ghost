@@ -198,7 +198,3 @@ routingManager.addAllRoutes(app);
 app.listen(config.port, "0.0.0.0", () => {
   core.logger.info(`Listening on http://0.0.0.0:${config.port}`);
 });
-
-app.listen(config.port, "0.0.0.0", () => {
-  core.logger.info(`Listening on http://0.0.0.0:${config.port}`);
-});

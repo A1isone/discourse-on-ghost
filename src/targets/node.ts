@@ -42,7 +42,6 @@ function createGhostAdminToken(): string {
   return jwt.sign({}, Buffer.from(secret, "hex"), {
     keyid: id,
     algorithm: "HS256",
-    expiresIn: "5m",
     audience: "/v5/admin/",
   });
 }

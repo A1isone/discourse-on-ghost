@@ -47,11 +47,25 @@ function createGhostAdminToken(): string {
   });
 }
 
+/**
+ * Compute an HMAC-SHA256 signature (hex) for a base64-encoded SSO payload using the configured SSO secret.
+ *
+ * @param payloadBase64 - The base64-encoded payload to sign.
+ * @returns The hex-encoded HMAC-SHA256 digest.
+ */
 function signHmac(payloadBase64: string): string {
   return crypto.createHmac("sha256", SSO_SECRET).update(payloadBase64).digest("hex");
 }
 
-// --- JWT session helpers ---
+/**
+ * Create a signed JWT session token for a user payload.
+ *
+ * The token is signed with HS256 and embeds the provided payload; it expires after SESSION_TTL_SECONDS.
+ *
+ * @param payload - Claims to include in the token (e.g., `{ sub, email, name, iat, exp }`)
+ * @param secret - HMAC secret used to sign the token
+ * @returns A compact JWT string usable as the session cookie value
+ */
 function signSessionJWT(payload: object, secret: string): string {
   return jwt.sign(payload, secret, {
     algorithm: "HS256",
@@ -59,6 +73,15 @@ function signSessionJWT(payload: object, secret: string): string {
   });
 }
 
+/**
+ * Verifies a JWT session token and returns its decoded payload or null if invalid.
+ *
+ * Attempts to verify `token` using `secret` via jsonwebtoken; on success returns the decoded payload (typically an object with session claims), and on failure returns `null` without throwing.
+ *
+ * @param token - The JWT string to verify.
+ * @param secret - The signing secret used to verify the token.
+ * @returns The decoded token payload on successful verification, or `null` if verification fails.
+ */
 function verifySessionJWT(token: string, secret: string): null | any {
   try {
     return jwt.verify(token, secret);

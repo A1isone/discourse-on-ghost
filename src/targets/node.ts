@@ -69,52 +69,44 @@ function verifySessionJWT(token: string, secret: string): null | any {
 app.get("/health", (_req, res) => res.status(200).send("OK"));
 
 // ------------------------- login-from-ghost -------------------------
-const loginFromGhost: RequestHandler = async (_req: Request, res: Response) => {
+// MODIFIED: This handler now correctly initiates SSO with Discourse
+const loginFromGhost: RequestHandler = async (req: Request, res: Response) => {
   core.logger.info("Starting login-from-ghost...");
 
   try {
-    if (!GHOST_URL || !GHOST_ADMIN_KEY || !SESSION_SECRET) {
-      core.logger.error("Missing Ghost config");
-      return res.status(500).send("Server missing Ghost config");
+    // This part is modified to check the session first
+    const token = req.cookies?.[SESSION_COOKIE] as string | undefined;
+    const session = token ? verifySessionJWT(token, SESSION_SECRET) : null;
+
+    if (!session) {
+      // If no session, redirect to Ghost to create one
+      core.logger.info("No session found, redirecting to Ghost portal to log in.");
+      // The return URL will bring the user back here to complete the SSO handshake
+      const returnUrl = `${req.protocol}://${req.get("host")}${req.originalUrl}`;
+      return res.redirect(
+        `${GHOST_URL}/#/portal/signin?redirect=${encodeURIComponent(returnUrl)}`
+      );
+    }
+    
+    if (!DISCOURSE_URL || !SSO_SECRET) {
+      core.logger.error("DISCOURSE_URL or SSO_SECRET missing");
+      return res.status(500).send("Server misconfigured");
     }
 
-    const token = createGhostAdminToken();
-    const ghostResp = await axios.get(`${GHOST_URL}/ghost/api/admin/members/`, {
-      headers: { Authorization: `Ghost ${token}` },
-      params: { limit: 1, order: "last_seen_at desc" },
-    });
+    // NEW: Logic to create a new SSO payload and redirect to Discourse
+    const nonce = crypto.randomBytes(16).toString("hex");
+    const payload = new URLSearchParams({
+        nonce,
+        return_sso_url: `${DISCOURSE_URL}/session/sso_login`,
+    }).toString();
 
-    const member = ghostResp.data?.members?.[0];
-    if (!member) {
-      core.logger.warn("No member found, redirecting to sign-in");
-      return res.redirect(`${GHOST_URL}/#/portal/signin`);
-    }
+    const payloadBase64 = Buffer.from(payload).toString('base64');
+    const signature = signHmac(payloadBase64);
 
-    const now = Math.floor(Date.now() / 1000);
-    const payload = {
-      sub: member.id,
-      email: member.email,
-      name: member.name || "",
-      iat: now,
-      exp: now + SESSION_TTL_SECONDS,
-    };
+    const redirectUrl = `${DISCOURSE_URL}/session/sso_provider?sso=${payloadBase64}&sig=${signature}`;
 
-    const cookie = signSessionJWT(payload, SESSION_SECRET);
-    res.cookie(SESSION_COOKIE, cookie, {
-      httpOnly: true,
-      secure: true,
-      sameSite: "lax",
-      maxAge: SESSION_TTL_SECONDS * 1000,
-      path: "/",
-    });
-
-    if (!DISCOURSE_URL) {
-      core.logger.error("DISCOURSE_URL missing");
-      return res.status(500).send("Missing DISCOURSE_URL");
-    }
-
-    core.logger.info(`Redirecting to Discourse: ${DISCOURSE_URL}`);
-    return res.redirect(302, DISCOURSE_URL);
+    core.logger.info(`Redirecting to Discourse to initiate SSO: ${redirectUrl}`);
+    return res.redirect(302, redirectUrl);
 
   } catch (err: any) {
     core.logger.error({ error: err?.response?.data || err.message }, "login-from-ghost failed");
@@ -126,12 +118,13 @@ const loginFromGhost: RequestHandler = async (_req: Request, res: Response) => {
 app.get("/login-from-ghost", loginFromGhost);
 
 // ------------------------- discourse/sso -------------------------
+// UNCHANGED: This handler correctly processes the callback from Discourse
 const discourseSSOHandler: RequestHandler = async (req: Request, res: Response) => {
   core.logger.info("Starting discourse/sso...");
 
   try {
-    if (!SSO_SECRET || !DISCOURSE_URL) {
-      core.logger.error("Missing SSO_SECRET or DISCOURSE_URL");
+    if (!SSO_SECRET || !DISCOURSE_URL || !GHOST_URL || !GHOST_ADMIN_KEY || !SESSION_SECRET) {
+      core.logger.error("Missing required server configuration");
       return res.status(500).send("Server misconfigured");
     }
 
@@ -149,20 +142,26 @@ const discourseSSOHandler: RequestHandler = async (req: Request, res: Response) 
 
     const token = req.cookies?.[SESSION_COOKIE] as string | undefined;
     const session = token ? verifySessionJWT(token, SESSION_SECRET) : null;
+    
+    // If session is invalid, redirect to the start of the login flow
     if (!session || (typeof session === "object" && "exp" in session && (session.exp as number) <= Math.floor(Date.now() / 1000))) {
-      return res.redirect(302, `${req.protocol}://${req.get("host")}/login-from-ghost`);
+      core.logger.warn("Invalid or expired session during SSO callback, restarting login flow.");
+      return res.redirect(302, `/login-from-ghost`);
     }
 
+    // Now we use the valid session to get member details
     const ghostToken = createGhostAdminToken();
-    const ghostResp = await axios.get(`${GHOST_URL}/ghost/api/admin/members/`, {
+    const ghostResp = await axios.get(`${GHOST_URL}/ghost/api/admin/members/${session.sub}/`, {
       headers: { Authorization: `Ghost ${ghostToken}` },
-      params: { filter: `id:'${session.sub}'`, fields: "id,email,name" },
+      params: { fields: "id,email,name" },
     });
 
     const member = ghostResp.data?.members?.[0];
-    if (!member) return res.status(404).send("Member not found");
+    if (!member) {
+      core.logger.error(`Member with ID ${session.sub} not found in Ghost.`);
+      return res.status(404).send("Member not found");
+    }
 
-    // 🔥 Add fields to quietly create and activate accounts
     const identity = new URLSearchParams({
       nonce,
       external_id: member.id,
@@ -177,7 +176,7 @@ const discourseSSOHandler: RequestHandler = async (req: Request, res: Response) 
     const returnSig = signHmac(b64);
     const redirectUrl = `${DISCOURSE_URL}/session/sso_login?sso=${encodeURIComponent(b64)}&sig=${returnSig}`;
 
-    core.logger.info("Redirecting back to Discourse", { redirectUrl });
+    core.logger.info("Redirecting back to Discourse to complete login", { redirectUrl });
     return res.redirect(302, redirectUrl);
 
   } catch (err: any) {

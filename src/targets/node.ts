@@ -96,9 +96,9 @@ const loginFromGhost: RequestHandler = async (_req: Request, res: Response) => {
   core.logger.info("Starting login-from-ghost...");
 
   try {
-    if (!GHOST_URL || !GHOST_ADMIN_KEY || !SESSION_SECRET) {
-      core.logger.error("Missing Ghost config");
-      return res.status(500).send("Server missing Ghost config");
+    if (!GHOST_URL || !GHOST_ADMIN_KEY || !SESSION_SECRET || !DISCOURSE_URL || !SSO_SECRET) {
+      core.logger.error("Missing server configuration");
+      return res.status(500).send("Server is missing required configuration");
     }
 
     const token = createGhostAdminToken();
@@ -114,7 +114,7 @@ const loginFromGhost: RequestHandler = async (_req: Request, res: Response) => {
     }
 
     const now = Math.floor(Date.now() / 1000);
-    const payload = {
+    const sessionPayload = {
       sub: member.id,
       email: member.email,
       name: member.name || "",
@@ -122,7 +122,7 @@ const loginFromGhost: RequestHandler = async (_req: Request, res: Response) => {
       exp: now + SESSION_TTL_SECONDS,
     };
 
-    const cookie = signSessionJWT(payload, SESSION_SECRET);
+    const cookie = signSessionJWT(sessionPayload, SESSION_SECRET);
     res.cookie(SESSION_COOKIE, cookie, {
       httpOnly: true,
       secure: true,
@@ -131,13 +131,23 @@ const loginFromGhost: RequestHandler = async (_req: Request, res: Response) => {
       path: "/",
     });
 
-    if (!DISCOURSE_URL) {
-      core.logger.error("DISCOURSE_URL missing");
-      return res.status(500).send("Missing DISCOURSE_URL");
-    }
+    // --- FIX STARTS HERE ---
+    // Create the SSO payload for Discourse
+    const ssoParams = new URLSearchParams({
+      nonce: crypto.randomBytes(16).toString("hex"),
+      external_id: member.id,
+      email: member.email,
+      username: (member.name || member.email.split("@")[0]).replace(/\s+/g, "_"),
+      name: member.name || "",
+    });
 
-    core.logger.info(`Redirecting to Discourse: ${DISCOURSE_URL}`);
-    return res.redirect(302, DISCOURSE_URL);
+    const ssoBase64 = Buffer.from(ssoParams.toString(), "utf8").toString("base64");
+    const ssoSignature = signHmac(ssoBase64);
+    const ssoUrl = `${DISCOURSE_URL}/session/sso_login?sso=${encodeURIComponent(ssoBase64)}&sig=${ssoSignature}`;
+    
+    core.logger.info(`Redirecting to Discourse SSO URL`);
+    return res.redirect(302, ssoUrl);
+    // --- FIX ENDS HERE ---
 
   } catch (err: any) {
     core.logger.error({ error: err?.response?.data || err.message }, "login-from-ghost failed");
@@ -149,6 +159,7 @@ const loginFromGhost: RequestHandler = async (_req: Request, res: Response) => {
 app.get("/login-from-ghost", loginFromGhost);
 
 // ------------------------- discourse/sso -------------------------
+// This handler is now mostly a fallback, but kept for completeness
 const discourseSSOHandler: RequestHandler = async (req: Request, res: Response) => {
   core.logger.info("Starting discourse/sso...");
 
@@ -160,7 +171,10 @@ const discourseSSOHandler: RequestHandler = async (req: Request, res: Response) 
 
     const sso = req.query.sso as string | undefined;
     const sig = req.query.sig as string | undefined;
-    if (!sso || !sig) return res.status(400).send("Missing sso or sig");
+    if (!sso || !sig) {
+        // If SSO params are missing, it might be an old link. Redirect to the new flow.
+        return res.redirect(302, `/login-from-ghost`);
+    }
 
     const expected = signHmac(sso);
     if (expected !== sig) return res.status(403).send("Invalid SSO signature");
@@ -173,7 +187,8 @@ const discourseSSOHandler: RequestHandler = async (req: Request, res: Response) 
     const token = req.cookies?.[SESSION_COOKIE] as string | undefined;
     const session = token ? verifySessionJWT(token, SESSION_SECRET) : null;
     if (!session || (typeof session === "object" && "exp" in session && (session.exp as number) <= Math.floor(Date.now() / 1000))) {
-      return res.redirect(302, `${req.protocol}://${req.get("host")}/login-from-ghost`);
+      // If session is invalid, restart the login flow.
+      return res.redirect(302, `/login-from-ghost`);
     }
 
     const ghostToken = createGhostAdminToken();

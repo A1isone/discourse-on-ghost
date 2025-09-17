@@ -116,17 +116,21 @@ const loginFromGhost: RequestHandler = async (req: Request, res: Response) => {
       nonce = crypto.randomBytes(16).toString("hex");
     }
     
-    // --- FINAL FIX STARTS HERE ---
     const memberId = req.query.member_id as string | undefined;
     const sessionToken = req.cookies?.[SESSION_COOKIE] as string | undefined;
     const session = sessionToken ? verifySessionJWT(sessionToken, SESSION_SECRET) : null;
     
-    const userId = memberId || session?.sub;
+    let userId = memberId || session?.sub;
 
+    // --- FINAL FIX STARTS HERE ---
     if (!userId) {
-        core.logger.warn("No member_id in query and no valid session cookie. Redirecting to Ghost Portal to sign in.");
-        return res.redirect(`${GHOST_URL}/#/portal/signin`);
+        core.logger.warn("No user ID found. Redirecting to Ghost Portal to refresh session.");
+        // If the member_id is missing or empty, the user might be on a cached page.
+        // Redirecting to the portal homepage will force Ghost to load the member session.
+        // The user can then click the Community link again.
+        return res.redirect(`${GHOST_URL}/#/portal/`);
     }
+    // --- FINAL FIX ENDS HERE ---
 
     core.logger.info(`Identifying user with ID: ${userId}. Fetching member details...`);
 
@@ -140,7 +144,6 @@ const loginFromGhost: RequestHandler = async (req: Request, res: Response) => {
       core.logger.error(`Could not find member with ID: ${userId}`);
       return res.status(404).send(`Member not found for ID: ${userId}`);
     }
-    // --- FINAL FIX ENDS HERE ---
 
     const now = Math.floor(Date.now() / 1000);
     const sessionPayload = {

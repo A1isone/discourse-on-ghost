@@ -118,27 +118,32 @@ const loginFromGhost: RequestHandler = async (req: Request, res: Response) => {
     
     // --- FINAL FIX STARTS HERE ---
     const memberId = req.query.member_id as string | undefined;
+    const sessionToken = req.cookies?.[SESSION_COOKIE] as string | undefined;
+    const session = sessionToken ? verifySessionJWT(sessionToken, SESSION_SECRET) : null;
     
-    if (!memberId) {
-        // This is the only valid entry point. If there is no member_id, the user must sign in.
-        core.logger.warn("No member ID provided in the query. Redirecting to Ghost Portal to sign in.");
+    // Prioritize the session cookie first. If it exists, we trust it.
+    let userId = session?.sub || memberId;
+    
+    if (!userId) {
+        // Only if both the session and the member_id are missing do we redirect.
+        core.logger.warn("No member ID in query and no valid session cookie. Redirecting to Ghost Portal to sign in.");
         return res.redirect(`${GHOST_URL}/#/portal/signin`);
     }
+    // --- FINAL FIX ENDS HERE ---
 
-    core.logger.info(`Member ID found: ${memberId}. Fetching member details...`);
+    core.logger.info(`Identifying user with ID: ${userId}. Fetching member details...`);
 
     const ghostToken = createGhostAdminToken();
-    const ghostResp = await axios.get(`${GHOST_URL}/ghost/api/admin/members/${memberId}/`, {
+    const ghostResp = await axios.get(`${GHOST_URL}/ghost/api/admin/members/${userId}/`, {
         headers: { Authorization: `Ghost ${ghostToken}` },
     });
 
     const member = ghostResp.data?.members?.[0];
     
     if (!member) {
-      core.logger.error(`Could not find member with ID: ${memberId}. The member may not exist or the API key is invalid.`);
-      return res.status(404).send(`Member not found for ID: ${memberId}`);
+      core.logger.error(`Could not find member with ID: ${userId}. The member may not exist or the API key is invalid.`);
+      return res.status(404).send(`Member not found for ID: ${userId}`);
     }
-    // --- FINAL FIX ENDS HERE ---
 
     const now = Math.floor(Date.now() / 1000);
     const sessionPayload = {

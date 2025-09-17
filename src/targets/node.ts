@@ -115,31 +115,32 @@ const loginFromGhost: RequestHandler = async (req: Request, res: Response) => {
       core.logger.info("No SSO params from Discourse, generating a new nonce...");
       nonce = crypto.randomBytes(16).toString("hex");
     }
-
-    // --- FIX STARTS HERE ---
+    
+    // --- FINAL FIX STARTS HERE ---
+    const memberId = req.query.member_id as string | undefined;
     const sessionToken = req.cookies?.[SESSION_COOKIE] as string | undefined;
     const session = sessionToken ? verifySessionJWT(sessionToken, SESSION_SECRET) : null;
+    
+    const userId = memberId || session?.sub;
 
-    if (!session || !session.sub) {
-        core.logger.warn("No valid session cookie found. Redirecting to Ghost Portal to sign in.");
-        // If there's no session, we can't know who the user is.
-        // Redirect them to the Ghost Portal. After they sign in, they will need to click the link again.
+    if (!userId) {
+        core.logger.warn("No member_id in query and no valid session cookie. Redirecting to Ghost Portal to sign in.");
         return res.redirect(`${GHOST_URL}/#/portal/signin`);
     }
 
-    core.logger.info(`Session found for user ID: ${session.sub}. Fetching member details...`);
+    core.logger.info(`Identifying user with ID: ${userId}. Fetching member details...`);
 
     const ghostToken = createGhostAdminToken();
-    const ghostResp = await axios.get(`${GHOST_URL}/ghost/api/admin/members/${session.sub}/`, {
+    const ghostResp = await axios.get(`${GHOST_URL}/ghost/api/admin/members/${userId}/`, {
       headers: { Authorization: `Ghost ${ghostToken}` },
     });
 
     const member = ghostResp.data?.members?.[0];
     if (!member) {
-      core.logger.error(`Could not find member with ID: ${session.sub}`);
-      return res.status(404).send(`Member not found for ID: ${session.sub}`);
+      core.logger.error(`Could not find member with ID: ${userId}`);
+      return res.status(404).send(`Member not found for ID: ${userId}`);
     }
-    // --- FIX ENDS HERE ---
+    // --- FINAL FIX ENDS HERE ---
 
     const now = Math.floor(Date.now() / 1000);
     const sessionPayload = {
@@ -184,10 +185,6 @@ app.get("/discourse/sso", discourseSSOHandler);
 // ------------------------- Start Server -------------------------
 const routingManager = new RoutingManager();
 routingManager.addAllRoutes(app);
-
-app.listen(config.port, "0.0.0.0", () => {
-  core.logger.info(`Listening on http://0.0.0.0:${config.port}`);
-});
 
 app.listen(config.port, "0.0.0.0", () => {
   core.logger.info(`Listening on http://0.0.0.0:${config.port}`);

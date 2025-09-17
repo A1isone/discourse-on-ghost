@@ -47,7 +47,6 @@ function createGhostAdminToken(): string {
 }
 
 function signHmac(payloadBase64: string): string {
-  // --- FIX IS HERE ---
   return crypto.createHmac("sha256", SSO_SECRET).update(payloadBase64).digest("hex");
 }
 
@@ -117,30 +116,29 @@ const loginFromGhost: RequestHandler = async (req: Request, res: Response) => {
       nonce = crypto.randomBytes(16).toString("hex");
     }
     
-    let member: any = null;
+    // --- FINAL FIX STARTS HERE ---
     const memberId = req.query.member_id as string | undefined;
+    
+    if (!memberId) {
+        // This is the only valid entry point. If there is no member_id, the user must sign in.
+        core.logger.warn("No member ID provided in the query. Redirecting to Ghost Portal to sign in.");
+        return res.redirect(`${GHOST_URL}/#/portal/signin`);
+    }
+
+    core.logger.info(`Member ID found: ${memberId}. Fetching member details...`);
 
     const ghostToken = createGhostAdminToken();
-    
-    if (memberId) {
-        core.logger.info(`Member ID found in query: ${memberId}. Fetching member...`);
-        const ghostResp = await axios.get(`${GHOST_URL}/ghost/api/admin/members/${memberId}/`, {
-            headers: { Authorization: `Ghost ${ghostToken}` },
-        });
-        member = ghostResp.data?.members?.[0];
-    } else {
-        core.logger.info("No member ID in query. Assuming Discourse-initiated flow, fetching most recent member...");
-        const ghostResp = await axios.get(`${GHOST_URL}/ghost/api/admin/members/`, {
-            headers: { Authorization: `Ghost ${ghostToken}` },
-            params: { limit: 1, order: "last_seen_at desc" },
-        });
-        member = ghostResp.data?.members?.[0];
-    }
+    const ghostResp = await axios.get(`${GHOST_URL}/ghost/api/admin/members/${memberId}/`, {
+        headers: { Authorization: `Ghost ${ghostToken}` },
+    });
+
+    const member = ghostResp.data?.members?.[0];
     
     if (!member) {
-      core.logger.error(`Could not find a member. Redirecting to Ghost Portal to sign in.`);
-      return res.redirect(`${GHOST_URL}/#/portal/signin`);
+      core.logger.error(`Could not find member with ID: ${memberId}. The member may not exist or the API key is invalid.`);
+      return res.status(404).send(`Member not found for ID: ${memberId}`);
     }
+    // --- FINAL FIX ENDS HERE ---
 
     const now = Math.floor(Date.now() / 1000);
     const sessionPayload = {

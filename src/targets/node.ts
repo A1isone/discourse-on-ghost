@@ -98,7 +98,6 @@ const loginFromGhost: RequestHandler = async (req: Request, res: Response) => {
       return res.status(500).send("Server is missing required configuration");
     }
 
-    // --- FIX STARTS HERE ---
     let nonce: string | null = null;
     const sso = req.query.sso as string | undefined;
     const sig = req.query.sig as string | undefined;
@@ -116,19 +115,31 @@ const loginFromGhost: RequestHandler = async (req: Request, res: Response) => {
       core.logger.info("No SSO params from Discourse, generating a new nonce...");
       nonce = crypto.randomBytes(16).toString("hex");
     }
-    // --- FIX ENDS HERE ---
 
-    const token = createGhostAdminToken();
-    const ghostResp = await axios.get(`${GHOST_URL}/ghost/api/admin/members/`, {
-      headers: { Authorization: `Ghost ${token}` },
-      params: { limit: 1, order: "last_seen_at desc" },
+    // --- FIX STARTS HERE ---
+    const sessionToken = req.cookies?.[SESSION_COOKIE] as string | undefined;
+    const session = sessionToken ? verifySessionJWT(sessionToken, SESSION_SECRET) : null;
+
+    if (!session || !session.sub) {
+        core.logger.warn("No valid session cookie found. Redirecting to Ghost Portal to sign in.");
+        // If there's no session, we can't know who the user is.
+        // Redirect them to the Ghost Portal. After they sign in, they will need to click the link again.
+        return res.redirect(`${GHOST_URL}/#/portal/signin`);
+    }
+
+    core.logger.info(`Session found for user ID: ${session.sub}. Fetching member details...`);
+
+    const ghostToken = createGhostAdminToken();
+    const ghostResp = await axios.get(`${GHOST_URL}/ghost/api/admin/members/${session.sub}/`, {
+      headers: { Authorization: `Ghost ${ghostToken}` },
     });
 
     const member = ghostResp.data?.members?.[0];
     if (!member) {
-      core.logger.warn("No member found, redirecting to sign-in");
-      return res.redirect(`${GHOST_URL}/#/portal/signin`);
+      core.logger.error(`Could not find member with ID: ${session.sub}`);
+      return res.status(404).send(`Member not found for ID: ${session.sub}`);
     }
+    // --- FIX ENDS HERE ---
 
     const now = Math.floor(Date.now() / 1000);
     const sessionPayload = {
@@ -150,7 +161,7 @@ const loginFromGhost: RequestHandler = async (req: Request, res: Response) => {
     
     const ssoUrl = createDiscourseSsoUrl(member, nonce);
     
-    core.logger.info(`Redirecting to Discourse SSO URL`);
+    core.logger.info(`Redirecting to Discourse SSO URL for member: ${member.email}`);
     return res.redirect(302, ssoUrl);
 
   } catch (err: any) {

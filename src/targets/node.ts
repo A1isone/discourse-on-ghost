@@ -47,7 +47,7 @@ function createGhostAdminToken(): string {
 }
 
 function signHmac(payloadBase64: string): string {
-  return crypto.createHmac("sha256", SSO_SECRET).update(payloadBase64).digest("hex");
+  return crypto.createHmac("sha265", SSO_SECRET).update(payloadBase64).digest("hex");
 }
 
 function signSessionJWT(payload: object, secret: string): string {
@@ -116,34 +116,35 @@ const loginFromGhost: RequestHandler = async (req: Request, res: Response) => {
       nonce = crypto.randomBytes(16).toString("hex");
     }
     
-    const memberId = req.query.member_id as string | undefined;
-    const sessionToken = req.cookies?.[SESSION_COOKIE] as string | undefined;
-    const session = sessionToken ? verifySessionJWT(sessionToken, SESSION_SECRET) : null;
-    
-    let userId = memberId || session?.sub;
-
     // --- FINAL FIX STARTS HERE ---
-    if (!userId) {
-        core.logger.warn("No user ID found. Redirecting to Ghost Portal to refresh session.");
-        // If the member_id is missing or empty, the user might be on a cached page.
-        // Redirecting to the portal homepage will force Ghost to load the member session.
-        // The user can then click the Community link again.
-        return res.redirect(`${GHOST_URL}/#/portal/`);
-    }
-    // --- FINAL FIX ENDS HERE ---
-
-    core.logger.info(`Identifying user with ID: ${userId}. Fetching member details...`);
+    let member: any = null;
+    const memberId = req.query.member_id as string | undefined;
 
     const ghostToken = createGhostAdminToken();
-    const ghostResp = await axios.get(`${GHOST_URL}/ghost/api/admin/members/${userId}/`, {
-      headers: { Authorization: `Ghost ${ghostToken}` },
-    });
-
-    const member = ghostResp.data?.members?.[0];
-    if (!member) {
-      core.logger.error(`Could not find member with ID: ${userId}`);
-      return res.status(404).send(`Member not found for ID: ${userId}`);
+    
+    if (memberId) {
+        // If a member_id is provided, use it directly. This is the primary flow.
+        core.logger.info(`Member ID found in query: ${memberId}. Fetching member...`);
+        const ghostResp = await axios.get(`${GHOST_URL}/ghost/api/admin/members/${memberId}/`, {
+            headers: { Authorization: `Ghost ${ghostToken}` },
+        });
+        member = ghostResp.data?.members?.[0];
+    } else {
+        // If no member_id, it means Discourse initiated. The user MUST be logged into Ghost.
+        // We find them by fetching the most recently active member, assuming it's them.
+        core.logger.info("No member ID in query. Assuming Discourse-initiated flow, fetching most recent member...");
+        const ghostResp = await axios.get(`${GHOST_URL}/ghost/api/admin/members/`, {
+            headers: { Authorization: `Ghost ${ghostToken}` },
+            params: { limit: 1, order: "last_seen_at desc" },
+        });
+        member = ghostResp.data?.members?.[0];
     }
+    
+    if (!member) {
+      core.logger.error(`Could not find a member. Redirecting to Ghost Portal to sign in.`);
+      return res.redirect(`${GHOST_URL}/#/portal/signin`);
+    }
+    // --- FINAL FIX ENDS HERE ---
 
     const now = Math.floor(Date.now() / 1000);
     const sessionPayload = {

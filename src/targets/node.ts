@@ -36,6 +36,7 @@ const GHOST_ADMIN_KEY = getEnv("GHOST_ADMIN_API_KEY");
 const SESSION_SECRET = getEnv("SESSION_SECRET");
 const SESSION_COOKIE = "sso_session";
 const SESSION_TTL_SECONDS = 10 * 60; // 10 minutes
+
 // --- Helper Functions ---
 
 function createGhostAdminToken(): string {
@@ -71,7 +72,14 @@ function verifySessionJWT(token: string): any | null {
 
 // STEP 1: The user clicks the community link, which directs them here.
 app.get("/login-from-ghost", (req: Request, res: Response) => {
-  core.logger.info("Step 1: Starting login flow. Redirecting to Ghost Portal.");
+  core.logger.info("Step 1: Starting login flow.");
+
+  const ghostSession = req.cookies?.["ghost-members-ssr"];
+  if (ghostSession) {
+    core.logger.info("User already logged in to Ghost. Skipping Portal.");
+    return res.redirect(302, "/ghost/callback");
+  }
+
   const callbackUrl = `https://${req.get("host")}/ghost/callback`;
   const ghostSignInUrl = `${GHOST_URL}/#/portal?action=signin&redirect=${encodeURIComponent(callbackUrl)}`;
   return res.redirect(302, ghostSignInUrl);

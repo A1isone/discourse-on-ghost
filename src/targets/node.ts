@@ -156,8 +156,6 @@ const loginFromGhost: RequestHandler = async (req: Request, res: Response) => {
 app.get("/health", (_req, res) => res.status(200).send("OK"));
 
 // All community links should point to this single endpoint.
-// The old routes like /ghost/callback and /discourse/sso are no longer needed in this file
-// because this new logic handles everything in one place.
 app.get("/login-from-ghost", loginFromGhost);
 
 // --- Start Server ---

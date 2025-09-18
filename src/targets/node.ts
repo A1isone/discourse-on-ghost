@@ -71,9 +71,9 @@ function verifySessionJWT(token: string, secret: string): null | any {
 app.get("/health", (_req, res) => res.status(200).send("OK"));
 
 // ------------------------- ghost/callback -------------------------
-// MODIFIED: Fixed API endpoint and added logging
+// MODIFIED: Enhanced logging
 const ghostCallback: RequestHandler = async (req: Request, res: Response) => {
-  core.logger.info("Starting ghost/callback...", { query: req.query, cookies: req.cookies });
+  core.logger.info("Starting ghost/callback...", { query: req.query, cookies: req.cookies, headers: req.headers.referer });
 
   try {
     if (!GHOST_URL || !GHOST_ADMIN_KEY || !SESSION_SECRET) {
@@ -81,7 +81,6 @@ const ghostCallback: RequestHandler = async (req: Request, res: Response) => {
       return res.status(500).send("Server misconfigured");
     }
 
-    // Fetch user data from Ghost
     const ghostToken = createGhostAdminToken();
     core.logger.info("Fetching user data from Ghost API", { url: `${GHOST_URL}/ghost/api/v5/admin/users/me/` });
     const ghostResp = await axios.get(`${GHOST_URL}/ghost/api/v5/admin/users/me/`, {
@@ -91,32 +90,29 @@ const ghostCallback: RequestHandler = async (req: Request, res: Response) => {
 
     const user = ghostResp.data?.users?.[0];
     if (!user) {
-      core.logger.error("No user found in Ghost API response");
+      core.logger.error("No user found in Ghost API response", { status: ghostResp.status });
       return res.status(404).send("User not found");
     }
 
     core.logger.info("User fetched from Ghost", { userId: user.id, email: user.email });
 
-    // Create session payload
     const sessionPayload = {
       sub: user.id,
       email: user.email,
       name: user.name || user.slug,
     };
 
-    // Sign and set session cookie
     const sessionToken = signSessionJWT(sessionPayload, SESSION_SECRET);
     res.cookie(SESSION_COOKIE, sessionToken, {
       httpOnly: true,
-      secure: req.protocol === "https",
+      secure: true,
       maxAge: SESSION_TTL_SECONDS * 1000,
       sameSite: "lax",
     });
 
     core.logger.info("Session cookie set", { userId: user.id });
 
-    // Redirect back to login-from-ghost to continue SSO
-    const returnUrl = `${req.protocol}://${req.get("host")}/login-from-ghost`;
+    const returnUrl = `https://${req.get("host")}/login-from-ghost`;
     core.logger.info(`Redirecting to login-from-ghost: ${returnUrl}`);
     return res.redirect(302, returnUrl);
   } catch (err: any) {
@@ -134,16 +130,15 @@ app.get("/ghost/callback", ghostCallback);
 // ------------------------- login-from-ghost -------------------------
 // MODIFIED: Enhanced logging
 const loginFromGhost: RequestHandler = async (req: Request, res: Response) => {
-  core.logger.info("Starting login-from-ghost...", { query: req.query, cookies: req.cookies });
+  core.logger.info("Starting login-from-ghost...", { query: req.query, cookies: req.cookies, headers: req.headers.referer });
 
   try {
-    // Check for session cookie
     const token = req.cookies?.[SESSION_COOKIE] as string | undefined;
     const session = token ? verifySessionJWT(token, SESSION_SECRET) : null;
 
     if (!session) {
       core.logger.info("No valid session, redirecting to Ghost sign-in");
-      const returnUrl = `${req.protocol}://${req.get("host")}/ghost/callback`;
+      const returnUrl = `https://${req.get("host")}/ghost/callback`;
       const signinUrl = `${GHOST_URL}/#/portal/signin?redirect=${encodeURIComponent(returnUrl)}`;
       core.logger.info(`Redirecting to Ghost sign-in: ${signinUrl}`);
       return res.redirect(302, signinUrl);
@@ -156,7 +151,6 @@ const loginFromGhost: RequestHandler = async (req: Request, res: Response) => {
       return res.status(500).send("Server misconfigured");
     }
 
-    // Create Discourse SSO payload
     const nonce = crypto.randomBytes(16).toString("hex");
     const payload = new URLSearchParams({
       nonce,
@@ -184,7 +178,7 @@ app.get("/login-from-ghost", loginFromGhost);
 // ------------------------- discourse/sso -------------------------
 // MODIFIED: Enhanced logging
 const discourseSSOHandler: RequestHandler = async (req: Request, res: Response) => {
-  core.logger.info("Starting discourse/sso...", { query: req.query });
+  core.logger.info("Starting discourse/sso...", { query: req.query, cookies: req.cookies, headers: req.headers.referer });
 
   try {
     if (!SSO_SECRET || !DISCOURSE_URL || !GHOST_URL || !GHOST_ADMIN_KEY || !SESSION_SECRET) {
@@ -223,7 +217,6 @@ const discourseSSOHandler: RequestHandler = async (req: Request, res: Response) 
 
     core.logger.info("Valid session found, fetching Ghost member", { userId: session.sub });
 
-    // Fetch member from Ghost
     const ghostToken = createGhostAdminToken();
     core.logger.info("Fetching member from Ghost API", { url: `${GHOST_URL}/ghost/api/v5/admin/members/${session.sub}/` });
     const ghostResp = await axios.get(`${GHOST_URL}/ghost/api/v5/admin/members/${session.sub}/`, {

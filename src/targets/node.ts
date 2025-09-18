@@ -36,6 +36,7 @@ const GHOST_ADMIN_KEY = getEnv("GHOST_ADMIN_API_KEY");
 const SESSION_SECRET = getEnv("SESSION_SECRET");
 const SESSION_COOKIE = "sso_session";
 const SESSION_TTL_SECONDS = 10 * 60; // 10 minutes
+
 // --- Helper Functions ---
 
 function createGhostAdminToken(): string {
@@ -71,7 +72,14 @@ function verifySessionJWT(token: string): any | null {
 
 // STEP 1: The user clicks the community link, which directs them here.
 app.get("/login-from-ghost", (req: Request, res: Response) => {
-  core.logger.info("Step 1: Starting login flow. Redirecting to Ghost Portal.");
+  core.logger.info("Step 1: Starting login flow.");
+
+  const ghostSession = req.cookies?.["ghost-members-ssr"];
+  if (ghostSession) {
+    core.logger.info("User already logged in to Ghost. Skipping Portal.");
+    return res.redirect(302, "/ghost/callback");
+  }
+
   const callbackUrl = `https://${req.get("host")}/ghost/callback`;
   const ghostSignInUrl = `${GHOST_URL}/#/portal?action=signin&redirect=${encodeURIComponent(callbackUrl)}`;
   return res.redirect(302, ghostSignInUrl);
@@ -100,7 +108,17 @@ const ghostCallback: RequestHandler = async (req: Request, res: Response) => {
       return res.status(404).send("Member not found.");
     }
 
-    core.logger.info(`Step 3: Verified member ${member.email}. Creating session.`);
+    // Check membership tier
+    const allowedTiers = ["Explorers", "Founders"];
+    const memberTiers = member.subscriptions?.map((s: any) => s.tier?.name).filter(Boolean) || [];
+
+    const hasAccess = memberTiers.some((tier: string) => allowedTiers.includes(tier));
+    if (!hasAccess) {
+      core.logger.warn(`Access denied for member ${member.email}. Tiers: ${memberTiers.join(", ")}`);
+      return res.status(403).send("Access denied. You must be an Explorer or Founder to join the community.");
+    }
+
+    core.logger.info(`Step 3: Verified member ${member.email} with tier(s): ${memberTiers.join(", ")}. Creating session.`);
 
     const sessionToken = signSessionJWT(member);
     res.cookie(SESSION_COOKIE, sessionToken, {
@@ -119,9 +137,9 @@ const ghostCallback: RequestHandler = async (req: Request, res: Response) => {
 };
 app.get("/ghost/callback", ghostCallback);
 
-// STEP 5: Construct the final payload and redirect to Discourse.
+// STEP 3: Construct the final payload and redirect to Discourse.
 const ssoDiscourse: RequestHandler = async (req: Request, res: Response) => {
-  core.logger.info("Step 5: Preparing to redirect to Discourse.");
+  core.logger.info("Step 4: Preparing to redirect to Discourse.");
   const sessionToken = req.cookies?.[SESSION_COOKIE];
   const member = sessionToken ? verifySessionJWT(sessionToken) : null;
 
@@ -134,6 +152,10 @@ const ssoDiscourse: RequestHandler = async (req: Request, res: Response) => {
     core.logger.error("Missing required member fields for SSO.");
     return res.status(400).send("Invalid member data.");
   }
+
+  const allowedTiers = ["Explorers", "Founders"];
+  const memberTiers = member.subscriptions?.map((s: any) => s.tier?.name).filter(Boolean) || [];
+  const userGroups = memberTiers.filter((tier: string) => allowedTiers.includes(tier)).join(",");
 
   const nonce = crypto.randomBytes(16).toString("hex");
   const externalId = member.uuid || member.id;
@@ -148,6 +170,7 @@ const ssoDiscourse: RequestHandler = async (req: Request, res: Response) => {
     email: member.email,
     name: member.name || "",
     username,
+    groups: userGroups,
   }).toString();
 
   const payloadBase64 = Buffer.from(discoursePayload).toString("base64");

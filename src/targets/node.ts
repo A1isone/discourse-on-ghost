@@ -32,16 +32,27 @@ const getEnv = (k: string) => (process.env[k] ?? "").trim();
 const SSO_SECRET = getEnv("DISCOURSE_SSO_SECRET");
 const DISCOURSE_URL = getEnv("DISCOURSE_URL");
 const GHOST_URL = getEnv("GHOST_URL");
+const GHOST_ADMIN_KEY = getEnv("GHOST_ADMIN_API_KEY"); // IMPORTANT: This is needed again
 const SESSION_SECRET = getEnv("SESSION_SECRET");
-const SESSION_COOKIE = "ghost_sso_member_session"; // Renamed for clarity
+const SESSION_COOKIE = "sso_session";
 const SESSION_TTL_SECONDS = 10 * 60; // 10 minutes
 
 // --- Helper Functions ---
 
-/**
- * Creates a signed JWT for the middleware's internal session management.
- * This session temporarily stores the Ghost Member's data.
- */
+function createGhostAdminToken(): string {
+  const [id, secret] = GHOST_ADMIN_KEY.split(":");
+  return jwt.sign({}, Buffer.from(secret, "hex"), {
+    keyid: id,
+    algorithm: "HS256",
+    audience: "/admin/",
+    expiresIn: "5m",
+  });
+}
+
+function signDiscourseHmac(payloadBase64: string): string {
+  return crypto.createHmac("sha256", SSO_SECRET).update(payloadBase64).digest("hex");
+}
+
 function signSessionJWT(payload: object): string {
   return jwt.sign(payload, SESSION_SECRET, {
     algorithm: "HS256",
@@ -49,9 +60,6 @@ function signSessionJWT(payload: object): string {
   });
 }
 
-/**
- * Verifies the middleware's internal session JWT.
- */
 function verifySessionJWT(token: string): any | null {
   try {
     return jwt.verify(token, SESSION_SECRET);
@@ -60,105 +68,98 @@ function verifySessionJWT(token: string): any | null {
   }
 }
 
-/**
- * Creates the HMAC-SHA256 signature required by Discourse SSO.
- */
-function signDiscourseHmac(payloadBase64: string): string {
-  return crypto.createHmac("sha256", SSO_SECRET).update(payloadBase64).digest("hex");
-}
+// --- Routes ---
 
-// --- Main SSO Route ---
+// STEP 1: The user clicks the community link, which directs them here.
+app.get("/login-from-ghost", (req: Request, res: Response) => {
+  core.logger.info("Step 1: Starting login flow. Redirecting to Ghost Portal.");
+  // This URL tells Ghost to send the user back to our /ghost/callback endpoint after login
+  const callbackUrl = `https://${req.get("host")}/ghost/callback`;
+  const ghostSignInUrl = `${GHOST_URL}/#/portal?action=signin&redirect=${encodeURIComponent(callbackUrl)}`;
+  return res.redirect(302, ghostSignInUrl);
+});
 
-/**
- * This is the primary entry point for the SSO process.
- * It checks if the user is logged into Ghost, and if so,
- * redirects them to Discourse to log in.
- */
-const loginFromGhost: RequestHandler = async (req: Request, res: Response) => {
-  core.logger.info("Starting SSO process...");
+// STEP 2: Ghost redirects the user here after a successful login.
+const ghostCallback: RequestHandler = async (req: Request, res: Response) => {
+  core.logger.info("Step 2: Received callback from Ghost.");
+  const token = req.query.token as string | undefined;
+
+  if (!token) {
+    core.logger.error("Ghost callback is missing token.");
+    return res.status(400).send("Callback from Ghost is missing the required token.");
+  }
 
   try {
-    // 1. Check for an existing, valid session cookie from THIS middleware.
-    const sessionToken = req.cookies?.[SESSION_COOKIE];
-    let member = sessionToken ? verifySessionJWT(sessionToken) : null;
+    // STEP 3: Exchange the token for member data using the Admin API.
+    const ghostAdminToken = createGhostAdminToken();
+    const response = await axios.get(`${GHOST_URL}/ghost/api/admin/members/token/`, {
+        headers: { Authorization: `Ghost ${ghostAdminToken}` },
+        params: { token },
+    });
 
-    // 2. If no valid session, verify the user's login status with Ghost.
+    const member = response.data?.members?.[0];
     if (!member) {
-      core.logger.info("No valid middleware session. Checking Ghost for member status...");
-      try {
-        // This is the key step: we ask the Ghost Member API who is logged in,
-        // passing along the user's browser cookies to identify them.
-        const ghostApiResponse = await axios.get(`${GHOST_URL}/api/members/me/`, {
-          headers: {
-            Cookie: req.headers.cookie, // Forward user's cookies to Ghost
-          },
-        });
-
-        member = ghostApiResponse.data.members[0];
-
-        if (member) {
-          core.logger.info(`Verified member from Ghost: ${member.email}`);
-          // Create our own short-lived session to avoid hitting the Ghost API on every request.
-          const newSessionToken = signSessionJWT(member);
-          res.cookie(SESSION_COOKIE, newSessionToken, {
-            httpOnly: true,
-            secure: true,
-            maxAge: SESSION_TTL_SECONDS * 1000,
-            sameSite: "lax",
-          });
-        }
-      } catch (error) {
-        // If the Ghost API call fails, it means the user is not logged into Ghost.
-        core.logger.info("User is not logged into Ghost. Redirecting to Ghost Portal.");
-        const returnUrl = `https://${req.get("host")}${req.originalUrl}`;
-        const ghostSignInUrl = `${GHOST_URL}/#/portal/signin?redirect=${encodeURIComponent(returnUrl)}`;
-        return res.redirect(302, ghostSignInUrl);
-      }
-    } else {
-        core.logger.info(`Valid middleware session found for member: ${member.email}`);
+      core.logger.error("Member not found for the provided token.");
+      return res.status(404).send("Member not found.");
     }
 
-    // 3. If we don't have a member after all checks, something is wrong.
-    if (!member) {
-      core.logger.error("Could not identify Ghost member after checks.");
-      return res.status(401).send("Unable to identify Ghost member. Please log in to your Ghost account.");
-    }
-
-    // 4. We have a verified member. Construct the SSO payload for Discourse.
-    const nonce = crypto.randomBytes(16).toString("hex");
-    const discoursePayload = new URLSearchParams({
-      nonce,
-      external_id: member.id,
-      email: member.email,
-      name: member.name || "",
-      username: (member.name || member.email.split("@")[0]).replace(/\s+/g, "_"),
-    }).toString();
-
-    const payloadBase64 = Buffer.from(discoursePayload).toString("base64");
-    const signature = signDiscourseHmac(payloadBase64);
-
-    const redirectUrl = `${DISCOURSE_URL}/session/sso_login?sso=${encodeURIComponent(
-      payloadBase64
-    )}&sig=${signature}`;
+    core.logger.info(`Step 3: Verified member ${member.email}. Creating session.`);
     
-    core.logger.info(`Redirecting verified member to Discourse: ${member.id}`);
-    return res.redirect(302, redirectUrl);
+    // Create our own session cookie to remember the user
+    const sessionToken = signSessionJWT(member);
+    res.cookie(SESSION_COOKIE, sessionToken, {
+      httpOnly: true,
+      secure: true,
+      maxAge: SESSION_TTL_SECONDS * 1000,
+      sameSite: "lax",
+    });
 
+    // STEP 4: Redirect to the final step to log into Discourse
+    return res.redirect(302, "/sso/discourse");
   } catch (err: any) {
-    const errorMessage = err?.response?.data || err.message;
-    core.logger.error({ error: errorMessage }, "SSO process failed with an unexpected error.");
-    console.error(err);
-    return res.status(500).send(`An unexpected error occurred during login: ${errorMessage}`);
+    const errorMsg = err.response?.data?.errors?.[0]?.message || err.message;
+    core.logger.error({ error: errorMsg }, "Failed to exchange Ghost token.");
+    return res.status(500).send(`Error verifying Ghost token: ${errorMsg}`);
   }
 };
+app.get("/ghost/callback", ghostCallback);
 
-// --- Route Definitions ---
+
+// STEP 5: Construct the final payload and redirect to Discourse.
+const ssoDiscourse: RequestHandler = async (req: Request, res: Response) => {
+  core.logger.info("Step 5: Preparing to redirect to Discourse.");
+  const sessionToken = req.cookies?.[SESSION_COOKIE];
+  const member = sessionToken ? verifySessionJWT(sessionToken) : null;
+
+  if (!member) {
+    core.logger.warn("No valid session found. Restarting login flow.");
+    return res.redirect(302, "/login-from-ghost");
+  }
+
+  const nonce = crypto.randomBytes(16).toString("hex");
+  const discoursePayload = new URLSearchParams({
+    nonce,
+    external_id: member.id,
+    email: member.email,
+    name: member.name || "",
+    username: (member.name || member.email.split("@")[0]).replace(/\s+/g, "_"),
+  }).toString();
+
+  const payloadBase64 = Buffer.from(discoursePayload).toString("base64");
+  const signature = signDiscourseHmac(payloadBase64);
+
+  const redirectUrl = `${DISCOURSE_URL}/session/sso_login?sso=${encodeURIComponent(
+    payloadBase64
+  )}&sig=${signature}`;
+  
+  core.logger.info(`Redirecting verified member to Discourse: ${member.id}`);
+  return res.redirect(302, redirectUrl);
+};
+app.get("/sso/discourse", ssoDiscourse);
+
+// --- Health Check and Server Start ---
 app.get("/health", (_req, res) => res.status(200).send("OK"));
 
-// All community links should point to this single endpoint.
-app.get("/login-from-ghost", loginFromGhost);
-
-// --- Start Server ---
 const routingManager = new RoutingManager();
 routingManager.addAllRoutes(app);
 

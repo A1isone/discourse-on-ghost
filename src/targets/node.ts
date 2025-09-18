@@ -32,11 +32,10 @@ const getEnv = (k: string) => (process.env[k] ?? "").trim();
 const SSO_SECRET = getEnv("DISCOURSE_SSO_SECRET");
 const DISCOURSE_URL = getEnv("DISCOURSE_URL");
 const GHOST_URL = getEnv("GHOST_URL");
-const GHOST_ADMIN_KEY = getEnv("GHOST_ADMIN_API_KEY"); // IMPORTANT: This is needed again
+const GHOST_ADMIN_KEY = getEnv("GHOST_ADMIN_API_KEY");
 const SESSION_SECRET = getEnv("SESSION_SECRET");
 const SESSION_COOKIE = "sso_session";
 const SESSION_TTL_SECONDS = 10 * 60; // 10 minutes
-
 // --- Helper Functions ---
 
 function createGhostAdminToken(): string {
@@ -73,7 +72,6 @@ function verifySessionJWT(token: string): any | null {
 // STEP 1: The user clicks the community link, which directs them here.
 app.get("/login-from-ghost", (req: Request, res: Response) => {
   core.logger.info("Step 1: Starting login flow. Redirecting to Ghost Portal.");
-  // This URL tells Ghost to send the user back to our /ghost/callback endpoint after login
   const callbackUrl = `https://${req.get("host")}/ghost/callback`;
   const ghostSignInUrl = `${GHOST_URL}/#/portal?action=signin&redirect=${encodeURIComponent(callbackUrl)}`;
   return res.redirect(302, ghostSignInUrl);
@@ -90,11 +88,10 @@ const ghostCallback: RequestHandler = async (req: Request, res: Response) => {
   }
 
   try {
-    // STEP 3: Exchange the token for member data using the Admin API.
     const ghostAdminToken = createGhostAdminToken();
     const response = await axios.get(`${GHOST_URL}/ghost/api/admin/members/token/`, {
-        headers: { Authorization: `Ghost ${ghostAdminToken}` },
-        params: { token },
+      headers: { Authorization: `Ghost ${ghostAdminToken}` },
+      params: { token },
     });
 
     const member = response.data?.members?.[0];
@@ -104,8 +101,7 @@ const ghostCallback: RequestHandler = async (req: Request, res: Response) => {
     }
 
     core.logger.info(`Step 3: Verified member ${member.email}. Creating session.`);
-    
-    // Create our own session cookie to remember the user
+
     const sessionToken = signSessionJWT(member);
     res.cookie(SESSION_COOKIE, sessionToken, {
       httpOnly: true,
@@ -114,7 +110,6 @@ const ghostCallback: RequestHandler = async (req: Request, res: Response) => {
       sameSite: "lax",
     });
 
-    // STEP 4: Redirect to the final step to log into Discourse
     return res.redirect(302, "/sso/discourse");
   } catch (err: any) {
     const errorMsg = err.response?.data?.errors?.[0]?.message || err.message;
@@ -123,7 +118,6 @@ const ghostCallback: RequestHandler = async (req: Request, res: Response) => {
   }
 };
 app.get("/ghost/callback", ghostCallback);
-
 
 // STEP 5: Construct the final payload and redirect to Discourse.
 const ssoDiscourse: RequestHandler = async (req: Request, res: Response) => {
@@ -136,23 +130,32 @@ const ssoDiscourse: RequestHandler = async (req: Request, res: Response) => {
     return res.redirect(302, "/login-from-ghost");
   }
 
+  if (!member.email || !member.id) {
+    core.logger.error("Missing required member fields for SSO.");
+    return res.status(400).send("Invalid member data.");
+  }
+
   const nonce = crypto.randomBytes(16).toString("hex");
+  const externalId = member.uuid || member.id;
+
+  const username = (member.name || member.email.split("@")[0])
+    .replace(/\s+/g, "_")
+    .replace(/[^a-zA-Z0-9_]/g, "");
+
   const discoursePayload = new URLSearchParams({
     nonce,
-    external_id: member.id,
+    external_id: externalId,
     email: member.email,
     name: member.name || "",
-    username: (member.name || member.email.split("@")[0]).replace(/\s+/g, "_"),
+    username,
   }).toString();
 
   const payloadBase64 = Buffer.from(discoursePayload).toString("base64");
   const signature = signDiscourseHmac(payloadBase64);
 
-  const redirectUrl = `${DISCOURSE_URL}/session/sso_login?sso=${encodeURIComponent(
-    payloadBase64
-  )}&sig=${signature}`;
-  
-  core.logger.info(`Redirecting verified member to Discourse: ${member.id}`);
+  const redirectUrl = `${DISCOURSE_URL}/session/sso_login?sso=${encodeURIComponent(payloadBase64)}&sig=${signature}`;
+
+  core.logger.info(`Redirecting verified member to Discourse: ${externalId}`);
   return res.redirect(302, redirectUrl);
 };
 app.get("/sso/discourse", ssoDiscourse);

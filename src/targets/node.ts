@@ -4,8 +4,9 @@ import express, { type Request, type Response, type RequestHandler } from "expre
 import cookieParser from "cookie-parser";
 import axios from "axios";
 import crypto from "crypto";
-import jwt from "jsonwebtoken"; // For Ghost Admin API and session cookies
+import jwt from "jsonwebtoken";
 
+// --- Boilerplate and Config Loading ---
 import { deferGetConfig } from "../services/config.js";
 import { useRequestLogging } from "../controllers/middleware.js";
 import { bootstrapInjector } from "../services/dependency-injection.js";
@@ -26,166 +27,157 @@ app.disable("x-powered-by");
 app.use(cookieParser());
 app.use(useRequestLogging());
 
-// ------------------------- ENV -------------------------
+// --- Environment Variables ---
 const getEnv = (k: string) => (process.env[k] ?? "").trim();
 const SSO_SECRET = getEnv("DISCOURSE_SSO_SECRET");
 const DISCOURSE_URL = getEnv("DISCOURSE_URL");
 const GHOST_URL = getEnv("GHOST_URL");
-const GHOST_ADMIN_KEY = getEnv("GHOST_ADMIN_API_KEY"); // "id:secret"
+const GHOST_ADMIN_KEY = getEnv("GHOST_ADMIN_API_KEY");
 const SESSION_SECRET = getEnv("SESSION_SECRET");
-const SESSION_COOKIE = "dog_member";
-const SESSION_TTL_SECONDS = 10 * 60;
+const SESSION_COOKIE = "sso_session";
+const SESSION_TTL_SECONDS = 10 * 60; // 10 minutes
+// --- Helper Functions ---
 
-// ------------------------- Helpers -------------------------
 function createGhostAdminToken(): string {
   const [id, secret] = GHOST_ADMIN_KEY.split(":");
   return jwt.sign({}, Buffer.from(secret, "hex"), {
     keyid: id,
     algorithm: "HS256",
-    audience: "/v5/admin/",
+    audience: "/admin/",
+    expiresIn: "5m",
   });
 }
 
-function signHmac(payloadBase64: string): string {
+function signDiscourseHmac(payloadBase64: string): string {
   return crypto.createHmac("sha256", SSO_SECRET).update(payloadBase64).digest("hex");
 }
 
-function signSessionJWT(payload: object, secret: string): string {
-  return jwt.sign(payload, secret, {
+function signSessionJWT(payload: object): string {
+  return jwt.sign(payload, SESSION_SECRET, {
     algorithm: "HS256",
+    expiresIn: SESSION_TTL_SECONDS,
   });
 }
 
-function verifySessionJWT(token: string, secret: string): null | any {
+function verifySessionJWT(token: string): any | null {
   try {
-    return jwt.verify(token, secret);
+    return jwt.verify(token, SESSION_SECRET);
   } catch {
     return null;
   }
 }
 
-function createDiscourseSsoUrl(member: { id: string; email: string; name: string | null }, nonce: string): string {
-  if (!DISCOURSE_URL || !SSO_SECRET) {
-    throw new Error("Cannot create SSO URL, DISCOURSE_URL or SSO_SECRET is not configured.");
+// --- Routes ---
+
+// STEP 1: The user clicks the community link, which directs them here.
+app.get("/login-from-ghost", (req: Request, res: Response) => {
+  core.logger.info("Step 1: Starting login flow. Redirecting to Ghost Portal.");
+  const callbackUrl = `https://${req.get("host")}/ghost/callback`;
+  const ghostSignInUrl = `${GHOST_URL}/#/portal?action=signin&redirect=${encodeURIComponent(callbackUrl)}`;
+  return res.redirect(302, ghostSignInUrl);
+});
+
+// STEP 2: Ghost redirects the user here after a successful login.
+const ghostCallback: RequestHandler = async (req: Request, res: Response) => {
+  core.logger.info("Step 2: Received callback from Ghost.");
+  const token = req.query.token as string | undefined;
+
+  if (!token) {
+    core.logger.error("Ghost callback is missing token.");
+    return res.status(400).send("Callback from Ghost is missing the required token.");
   }
 
-  const ssoParams = new URLSearchParams({
-    nonce,
-    external_id: member.id,
-    email: member.email,
-    username: (member.name || member.email.split("@")[0]).replace(/\s+/g, "_"),
-    name: member.name || "",
-    require_activation: "false",
-    suppress_welcome_message: "true",
-  });
-
-  const ssoBase64 = Buffer.from(ssoParams.toString(), "utf8").toString("base64");
-  const ssoSignature = signHmac(ssoBase64);
-  
-  return `${DISCOURSE_URL}/session/sso_login?sso=${encodeURIComponent(ssoBase64)}&sig=${ssoSignature}`;
-}
-
-// ------------------------- Routes -------------------------
-app.get("/health", (_req, res) => res.status(200).send("OK"));
-
-// ------------------------- login-from-ghost -------------------------
-const loginFromGhost: RequestHandler = async (req: Request, res: Response) => {
-  core.logger.info("Starting login-from-ghost...");
-  
   try {
-    if (!GHOST_URL || !GHOST_ADMIN_KEY || !SESSION_SECRET || !DISCOURSE_URL || !SSO_SECRET) {
-      core.logger.error("Missing server configuration");
-      return res.status(500).send("Server is missing required configuration");
-    }
-
-    let nonce: string | null = null;
-    const sso = req.query.sso as string | undefined;
-    const sig = req.query.sig as string | undefined;
-
-    if (sso && sig) {
-      core.logger.info("Received SSO request from Discourse, extracting nonce...");
-      const expected = signHmac(sso);
-      if (expected !== sig) return res.status(403).send("Invalid SSO signature from Discourse");
-
-      const decoded = Buffer.from(sso, "base64").toString("utf8");
-      const params = new URLSearchParams(decoded);
-      nonce = params.get("nonce");
-      if (!nonce) return res.status(400).send("Missing nonce from Discourse payload");
-    } else {
-      core.logger.info("No SSO params from Discourse, generating a new nonce...");
-      nonce = crypto.randomBytes(16).toString("hex");
-    }
-    
-    // --- FINAL FIX STARTS HERE ---
-    const memberId = req.query.member_id as string | undefined;
-    const sessionToken = req.cookies?.[SESSION_COOKIE] as string | undefined;
-    const session = sessionToken ? verifySessionJWT(sessionToken, SESSION_SECRET) : null;
-    
-    // Prioritize the session cookie first. If it exists, we trust it.
-    let userId = session?.sub || memberId;
-    
-    if (!userId) {
-        // Only if both the session and the member_id are missing do we redirect.
-        core.logger.warn("No member ID in query and no valid session cookie. Redirecting to Ghost Portal to sign in.");
-        return res.redirect(`${GHOST_URL}/#/portal/signin`);
-    }
-    // --- FINAL FIX ENDS HERE ---
-
-    core.logger.info(`Identifying user with ID: ${userId}. Fetching member details...`);
-
-    const ghostToken = createGhostAdminToken();
-    const ghostResp = await axios.get(`${GHOST_URL}/ghost/api/admin/members/${userId}/`, {
-        headers: { Authorization: `Ghost ${ghostToken}` },
+    const ghostAdminToken = createGhostAdminToken();
+    const response = await axios.get(`${GHOST_URL}/ghost/api/admin/members/token/`, {
+      headers: { Authorization: `Ghost ${ghostAdminToken}` },
+      params: { token },
     });
 
-    const member = ghostResp.data?.members?.[0];
-    
+    const member = response.data?.members?.[0];
     if (!member) {
-      core.logger.error(`Could not find member with ID: ${userId}. The member may not exist or the API key is invalid.`);
-      return res.status(404).send(`Member not found for ID: ${userId}`);
+      core.logger.error("Member not found for the provided token.");
+      return res.status(404).send("Member not found.");
     }
 
-    const now = Math.floor(Date.now() / 1000);
-    const sessionPayload = {
-      sub: member.id,
-      email: member.email,
-      name: member.name || "",
-      iat: now,
-      exp: now + SESSION_TTL_SECONDS,
-    };
+    // Check membership tier
+    const allowedTiers = ["Explorers", "Founders"];
+    const memberTiers = member.subscriptions?.map((s: any) => s.tier?.name).filter(Boolean) || [];
 
-    const cookie = signSessionJWT(sessionPayload, SESSION_SECRET);
-    res.cookie(SESSION_COOKIE, cookie, {
+    const hasAccess = memberTiers.some((tier: string) => allowedTiers.includes(tier));
+    if (!hasAccess) {
+      core.logger.warn(`Access denied for member ${member.email}. Tiers: ${memberTiers.join(", ")}`);
+      return res.status(403).send("Access denied. You must be an Explorer or Founder to join the community.");
+    }
+
+    core.logger.info(`Step 3: Verified member ${member.email} with tier(s): ${memberTiers.join(", ")}. Creating session.`);
+
+    const sessionToken = signSessionJWT(member);
+    res.cookie(SESSION_COOKIE, sessionToken, {
       httpOnly: true,
       secure: true,
-      sameSite: "lax",
       maxAge: SESSION_TTL_SECONDS * 1000,
-      path: "/",
+      sameSite: "lax",
     });
-    
-    const ssoUrl = createDiscourseSsoUrl(member, nonce);
-    
-    core.logger.info(`Redirecting to Discourse SSO URL for member: ${member.email}`);
-    return res.redirect(302, ssoUrl);
 
+    return res.redirect(302, "/sso/discourse");
   } catch (err: any) {
-    core.logger.error({ error: err?.response?.data || err.message }, "login-from-ghost failed",err);
-    console.error(err);
-    return res.status(500).send(`login-from-ghost failed: ${err.message}`);
+    const errorMsg = err.response?.data?.errors?.[0]?.message || err.message;
+    core.logger.error({ error: errorMsg }, "Failed to exchange Ghost token.");
+    return res.status(500).send(`Error verifying Ghost token: ${errorMsg}`);
   }
 };
+app.get("/ghost/callback", ghostCallback);
 
-app.get("/login-from-ghost", loginFromGhost);
+// STEP 3: Construct the final payload and redirect to Discourse.
+const ssoDiscourse: RequestHandler = async (req: Request, res: Response) => {
+  core.logger.info("Step 4: Preparing to redirect to Discourse.");
+  const sessionToken = req.cookies?.[SESSION_COOKIE];
+  const member = sessionToken ? verifySessionJWT(sessionToken) : null;
 
-// ------------------------- discourse/sso (Legacy Fallback) -------------------------
-const discourseSSOHandler: RequestHandler = async (_req: Request, res: Response) => {
-  core.logger.info("Redirecting from legacy SSO endpoint to login-from-ghost.");
-  return res.redirect(302, `/login-from-ghost`);
+  if (!member) {
+    core.logger.warn("No valid session found. Restarting login flow.");
+    return res.redirect(302, "/login-from-ghost");
+  }
+
+  if (!member.email || !member.id) {
+    core.logger.error("Missing required member fields for SSO.");
+    return res.status(400).send("Invalid member data.");
+  }
+
+  const allowedTiers = ["Explorers", "Founders"];
+  const memberTiers = member.subscriptions?.map((s: any) => s.tier?.name).filter(Boolean) || [];
+  const userGroups = memberTiers.filter((tier: string) => allowedTiers.includes(tier)).join(",");
+
+  const nonce = crypto.randomBytes(16).toString("hex");
+  const externalId = member.uuid || member.id;
+
+  const username = (member.name || member.email.split("@")[0])
+    .replace(/\s+/g, "_")
+    .replace(/[^a-zA-Z0-9_]/g, "");
+
+  const discoursePayload = new URLSearchParams({
+    nonce,
+    external_id: externalId,
+    email: member.email,
+    name: member.name || "",
+    username,
+    groups: userGroups,
+  }).toString();
+
+  const payloadBase64 = Buffer.from(discoursePayload).toString("base64");
+  const signature = signDiscourseHmac(payloadBase64);
+
+  const redirectUrl = `${DISCOURSE_URL}/session/sso_login?sso=${encodeURIComponent(payloadBase64)}&sig=${signature}`;
+
+  core.logger.info(`Redirecting verified member to Discourse: ${externalId}`);
+  return res.redirect(302, redirectUrl);
 };
+app.get("/sso/discourse", ssoDiscourse);
 
-app.get("/discourse/sso", discourseSSOHandler);
+// --- Health Check and Server Start ---
+app.get("/health", (_req, res) => res.status(200).send("OK"));
 
-// ------------------------- Start Server -------------------------
 const routingManager = new RoutingManager();
 routingManager.addAllRoutes(app);
 

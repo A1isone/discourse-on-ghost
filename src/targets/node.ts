@@ -169,7 +169,7 @@ const loginFromGhost: RequestHandler = async (req: Request, res: Response) => {
     return res.redirect(302, ssoUrl);
 
   } catch (err: any) {
-    core.logger.error({ error: err?.response?.data || err.message }, "login-from-ghost failed");
+    core.logger.error({ error: err?.response?.data || err.message }, "login-from-ghost failed",err);
     console.error(err);
     return res.status(500).send(`login-from-ghost failed: ${err.message}`);
   }

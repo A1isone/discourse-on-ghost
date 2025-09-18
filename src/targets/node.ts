@@ -43,6 +43,7 @@ function createGhostAdminToken(): string {
     keyid: id,
     algorithm: "HS256",
     audience: "/v5/admin/",
+    expiresIn: "5m",
   });
 }
 
@@ -70,14 +71,20 @@ function verifySessionJWT(token: string, secret: string): null | any {
 app.get("/health", (_req, res) => res.status(200).send("OK"));
 
 // ------------------------- ghost/callback -------------------------
-// NEW: Handle Ghost login redirect to set session cookie
+// MODIFIED: Fixed API endpoint and added logging
 const ghostCallback: RequestHandler = async (req: Request, res: Response) => {
-  core.logger.info("Starting ghost/callback...");
+  core.logger.info("Starting ghost/callback...", { query: req.query, cookies: req.cookies });
 
   try {
-    // Fetch user data from Ghost after login
+    if (!GHOST_URL || !GHOST_ADMIN_KEY || !SESSION_SECRET) {
+      core.logger.error("Missing GHOST_URL, GHOST_ADMIN_API_KEY, or SESSION_SECRET");
+      return res.status(500).send("Server misconfigured");
+    }
+
+    // Fetch user data from Ghost
     const ghostToken = createGhostAdminToken();
-    const ghostResp = await axios.get(`${GHOST_URL}/ghost/api/admin/users/me/`, {
+    core.logger.info("Fetching user data from Ghost API", { url: `${GHOST_URL}/ghost/api/v5/admin/users/me/` });
+    const ghostResp = await axios.get(`${GHOST_URL}/ghost/api/v5/admin/users/me/`, {
       headers: { Authorization: `Ghost ${ghostToken}` },
       params: { include: "roles" },
     });
@@ -87,6 +94,8 @@ const ghostCallback: RequestHandler = async (req: Request, res: Response) => {
       core.logger.error("No user found in Ghost API response");
       return res.status(404).send("User not found");
     }
+
+    core.logger.info("User fetched from Ghost", { userId: user.id, email: user.email });
 
     // Create session payload
     const sessionPayload = {
@@ -101,17 +110,20 @@ const ghostCallback: RequestHandler = async (req: Request, res: Response) => {
       httpOnly: true,
       secure: req.protocol === "https",
       maxAge: SESSION_TTL_SECONDS * 1000,
+      sameSite: "lax",
     });
 
-    core.logger.info("Session cookie set, redirecting to login-from-ghost", {
-      userId: user.id,
-    });
+    core.logger.info("Session cookie set", { userId: user.id });
 
     // Redirect back to login-from-ghost to continue SSO
     const returnUrl = `${req.protocol}://${req.get("host")}/login-from-ghost`;
+    core.logger.info(`Redirecting to login-from-ghost: ${returnUrl}`);
     return res.redirect(302, returnUrl);
   } catch (err: any) {
-    core.logger.error({ error: err?.response?.data || err.message }, "Ghost callback failed");
+    core.logger.error(
+      { error: err?.response?.data || err.message, status: err?.response?.status },
+      "Ghost callback failed"
+    );
     console.error(err);
     return res.status(500).send(`Ghost callback failed: ${err.message}`);
   }
@@ -120,9 +132,9 @@ const ghostCallback: RequestHandler = async (req: Request, res: Response) => {
 app.get("/ghost/callback", ghostCallback);
 
 // ------------------------- login-from-ghost -------------------------
-// MODIFIED: Enhanced logging and session validation
+// MODIFIED: Enhanced logging
 const loginFromGhost: RequestHandler = async (req: Request, res: Response) => {
-  core.logger.info("Starting login-from-ghost...", { query: req.query });
+  core.logger.info("Starting login-from-ghost...", { query: req.query, cookies: req.cookies });
 
   try {
     // Check for session cookie
@@ -132,9 +144,9 @@ const loginFromGhost: RequestHandler = async (req: Request, res: Response) => {
     if (!session) {
       core.logger.info("No valid session, redirecting to Ghost sign-in");
       const returnUrl = `${req.protocol}://${req.get("host")}/ghost/callback`;
-      return res.redirect(
-        `${GHOST_URL}/#/portal/signin?redirect=${encodeURIComponent(returnUrl)}`
-      );
+      const signinUrl = `${GHOST_URL}/#/portal/signin?redirect=${encodeURIComponent(returnUrl)}`;
+      core.logger.info(`Redirecting to Ghost sign-in: ${signinUrl}`);
+      return res.redirect(302, signinUrl);
     }
 
     core.logger.info("Valid session found", { userId: session.sub });
@@ -170,7 +182,7 @@ const loginFromGhost: RequestHandler = async (req: Request, res: Response) => {
 app.get("/login-from-ghost", loginFromGhost);
 
 // ------------------------- discourse/sso -------------------------
-// MODIFIED: Added logging for better debugging
+// MODIFIED: Enhanced logging
 const discourseSSOHandler: RequestHandler = async (req: Request, res: Response) => {
   core.logger.info("Starting discourse/sso...", { query: req.query });
 
@@ -213,7 +225,8 @@ const discourseSSOHandler: RequestHandler = async (req: Request, res: Response) 
 
     // Fetch member from Ghost
     const ghostToken = createGhostAdminToken();
-    const ghostResp = await axios.get(`${GHOST_URL}/ghost/api/admin/members/${session.sub}/`, {
+    core.logger.info("Fetching member from Ghost API", { url: `${GHOST_URL}/ghost/api/v5/admin/members/${session.sub}/` });
+    const ghostResp = await axios.get(`${GHOST_URL}/ghost/api/v5/admin/members/${session.sub}/`, {
       headers: { Authorization: `Ghost ${ghostToken}` },
       params: { fields: "id,email,name" },
     });
@@ -223,6 +236,8 @@ const discourseSSOHandler: RequestHandler = async (req: Request, res: Response) 
       core.logger.error(`Member with ID ${session.sub} not found in Ghost`);
       return res.status(404).send("Member not found");
     }
+
+    core.logger.info("Member fetched from Ghost", { userId: member.id, email: member.email });
 
     const identity = new URLSearchParams({
       nonce,
@@ -241,7 +256,10 @@ const discourseSSOHandler: RequestHandler = async (req: Request, res: Response) 
     core.logger.info("Redirecting back to Discourse to complete login", { redirectUrl });
     return res.redirect(302, redirectUrl);
   } catch (err: any) {
-    core.logger.error({ error: err?.response?.data || err.message }, "SSO handler error");
+    core.logger.error(
+      { error: err?.response?.data || err.message, status: err?.response?.status },
+      "SSO handler error"
+    );
     console.error(err);
     return res.status(500).send(`SSO error: ${err.message}`);
   }
